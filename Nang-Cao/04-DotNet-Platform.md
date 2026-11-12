@@ -88,6 +88,147 @@ Vì `CacheService` chỉ tạo 1 lần duy nhất lúc app khởi động, nó s
 
 ✅ Quy tắc nhớ nhanh: **vòng đời ngắn có thể phụ thuộc vòng đời dài hơn** (Transient dùng Singleton: OK), **không bao giờ ngược lại** (Singleton dùng Scoped/Transient: NGUY HIỂM).
 
+### 2.2. Resolve nhiều implementation của cùng 1 interface
+
+### 🧠 Ví dụ trước
+
+Hệ thống cần gửi thông báo qua **cả 3 kênh cùng lúc** (Email, SMS, Push) mỗi khi có đơn hàng mới — không phải chọn 1 trong 3, mà chạy **tất cả**.
+
+```csharp
+interface INotificationChannel { Task SendAsync(string message); }
+
+class EmailChannel : INotificationChannel { public Task SendAsync(string m) => /* ... */ Task.CompletedTask; }
+class SmsChannel   : INotificationChannel { public Task SendAsync(string m) => /* ... */ Task.CompletedTask; }
+class PushChannel  : INotificationChannel { public Task SendAsync(string m) => /* ... */ Task.CompletedTask; }
+```
+
+```csharp
+// Đăng ký CẢ 3 cùng 1 interface — KHÔNG ghi đè lẫn nhau, container tự gom thành 1 danh sách
+builder.Services.AddSingleton<INotificationChannel, EmailChannel>();
+builder.Services.AddSingleton<INotificationChannel, SmsChannel>();
+builder.Services.AddSingleton<INotificationChannel, PushChannel>();
+```
+
+```csharp
+class OrderNotifier
+{
+    private readonly IEnumerable<INotificationChannel> _channels; // inject TẤT CẢ cùng lúc qua IEnumerable<T>
+
+    public OrderNotifier(IEnumerable<INotificationChannel> channels) => _channels = channels;
+
+    public async Task NotifyAllAsync(string message)
+    {
+        foreach (var channel in _channels) // tự động có đủ 3: Email, Sms, Push
+            await channel.SendAsync(message);
+    }
+}
+```
+
+📌 Khi bạn đăng ký **nhiều lần cùng 1 interface** với các class implement khác nhau, DI container của ASP.NET Core **không ghi đè** lần đăng ký trước — nó âm thầm gom tất cả lại thành 1 danh sách nội bộ. Inject `IEnumerable<INotificationChannel>` (thay vì `INotificationChannel` đơn lẻ) sẽ trả về **toàn bộ** danh sách đó, theo đúng thứ tự đã đăng ký.
+
+⚠️ Nếu bạn vô tình inject `INotificationChannel` (không có `IEnumerable<>`) trong tình huống có nhiều đăng ký, container chỉ trả về **implementation ĐĂNG KÝ SAU CÙNG** (`PushChannel` ở ví dụ trên) — không báo lỗi gì cả, chỉ âm thầm "mất" Email và Sms, dễ gây bug khó phát hiện vì không có ngoại lệ nào được ném ra.
+
+### 2.3. Keyed Services (.NET 8+) — nhiều implementation, nhưng cần CHỌN ĐÚNG 1 CÁI theo khóa
+
+### 🧠 Ví dụ trước
+
+Khác với tình huống trên (cần **cả 3** chạy cùng lúc), giờ hệ thống thanh toán cần chọn **đúng 1** cổng thanh toán theo tên provider user chọn — đây là bài toán Factory đã thấy ở file 08, nhưng trước .NET 8 phải tự viết `IPaymentGatewayFactory` tay; từ .NET 8, container có sẵn khái niệm "khóa" (key) để làm đúng việc này.
+
+```csharp
+builder.Services.AddKeyedSingleton<IPaymentGateway, VnPayGateway>("vnpay");
+builder.Services.AddKeyedSingleton<IPaymentGateway, MomoGateway>("momo");
+```
+
+```csharp
+class PaymentController
+{
+    private readonly IPaymentGateway _gateway;
+
+    // [FromKeyedServices] báo container: "lấy ĐÚNG bản đăng ký với khóa 'vnpay'", không phải bản nào khác
+    public PaymentController([FromKeyedServices("vnpay")] IPaymentGateway gateway) => _gateway = gateway;
+}
+
+// Hoặc resolve thủ công khi khóa chỉ biết được LÚC CHẠY (ví dụ đọc từ request)
+IPaymentGateway gateway = serviceProvider.GetRequiredKeyedService<IPaymentGateway>(providerNameFromRequest);
+```
+
+✅ **Phân biệt nhanh với mục 2.2:** `IEnumerable<T>` dùng khi cần **TẤT CẢ** implementation cùng lúc (notify mọi kênh). Keyed Services dùng khi có nhiều implementation nhưng mỗi lần chỉ cần **ĐÚNG 1 CÁI cụ thể**, chọn theo 1 "tên" đã biết trước (hoặc biết lúc runtime) — thay thế gọn gàng cho việc tự viết Factory Pattern tay (file 08) chỉ để làm đúng việc "chọn 1 trong N theo điều kiện".
+
+### 2.4. Factory injection — khi cần tạo object LÚC CHẠY theo tham số, container không tự biết trước
+
+### 🧠 Ví dụ trước
+
+DI container resolve dependency dựa trên **type đã đăng ký sẵn lúc khởi động** — nhưng nếu bạn cần tạo nhiều `Report` khác nhau, mỗi cái khởi tạo với 1 `reportId` chỉ biết được **lúc đang chạy** (không phải lúc khởi động app), container không có cách nào tự "đoán" tham số đó.
+
+```csharp
+class Report
+{
+    public Report(int reportId, IReportDataSource dataSource) { /* ... */ } // "reportId" chỉ biết lúc runtime
+}
+
+// ⚠️ KHÔNG đăng ký được Report trực tiếp — container không biết "reportId" lấy ở đâu ra
+```
+
+```csharp
+// ✅ Đăng ký 1 FACTORY DELEGATE, container tự inject sẵn các dependency CỐ ĐỊNH (IReportDataSource),
+// còn tham số runtime (reportId) do CHÍNH BẠN truyền vào lúc gọi factory
+builder.Services.AddTransient<Func<int, Report>>(sp => reportId =>
+    new Report(reportId, sp.GetRequiredService<IReportDataSource>()));
+
+class ReportController
+{
+    private readonly Func<int, Report> _reportFactory;
+    public ReportController(Func<int, Report> reportFactory) => _reportFactory = reportFactory;
+
+    public void Generate(int id)
+    {
+        var report = _reportFactory(id); // TẠO object MỚI, đúng lúc cần, với tham số runtime
+    }
+}
+```
+
+📌 Thay vì inject thẳng `Report`, bạn inject **1 "cái máy tạo ra Report"** (`Func<int, Report>`) — container chỉ cần biết cách tạo ra "cái máy" đó (các dependency cố định của `Report` đã inject sẵn bên trong lambda), còn tham số thay đổi theo từng lần gọi thì để code của bạn tự truyền vào lúc cần, không phải lúc khởi động app.
+
+### ⚠️ Service Locator — anti-pattern cần tránh, dễ nhầm với Factory ở trên
+
+```csharp
+// ⚠️ ANTI-PATTERN: inject thẳng IServiceProvider rồi tự ý "xin" dependency bên trong thân method
+class OrderService
+{
+    private readonly IServiceProvider _provider;
+    public OrderService(IServiceProvider provider) => _provider = provider; // che giấu TOÀN BỘ dependency thật sự
+
+    public void PlaceOrder(Order order)
+    {
+        var repo = _provider.GetRequiredService<IOrderRepository>(); // "xin" ngay trong thân method, không qua constructor
+        repo.Save(order);
+    }
+}
+```
+
+📌 Khác biệt cốt lõi với Factory injection (mục 2.4): Factory injection vẫn khai báo **rõ ràng, tường minh** trong constructor "tôi cần 1 cái máy tạo Report" — người đọc code, công cụ test, đều thấy ngay dependency thật sự là gì. Service Locator thì **giấu nhẹm** mọi dependency thật sự đằng sau 1 `IServiceProvider` chung chung — nhìn constructor không ai biết `OrderService` thật ra cần những gì, viết unit test phải tự dựng cả 1 `IServiceProvider` giả thay vì chỉ cần mock đúng 1 interface cần dùng. ⚠️ **Quy tắc:** chỉ `IServiceProvider`/`IServiceScopeFactory` mới nên xuất hiện ở đúng những nơi **thật sự cần tạo scope hoặc resolve động** (ví dụ `BackgroundService` ở mục 6 bên dưới) — không bao giờ dùng nó như "cách lười" để né khai báo dependency rõ ràng qua constructor.
+
+### 2.5. `TryAddSingleton`/`TryAddScoped` — tránh đăng ký trùng khi viết thư viện dùng chung
+
+```csharp
+public static class LoggingServiceExtensions
+{
+    public static IServiceCollection AddMyLogging(this IServiceCollection services)
+    {
+        services.TryAddSingleton<ILogger, ConsoleLogger>(); // CHỈ thêm nếu CHƯA có ai đăng ký ILogger trước đó
+        return services;
+    }
+}
+```
+
+📌 `TryAdd*` khác `Add*` ở đúng 1 điểm: nếu interface đó **đã được đăng ký rồi** (bởi chính ứng dụng, hoặc 1 thư viện khác gọi trước), `TryAdd*` **bỏ qua, không ghi đè** — còn `Add*` (như mục 2.2 đã thấy) luôn **cộng dồn thêm 1 bản đăng ký mới**. ✅ Dùng `TryAdd*` khi viết các extension method đóng gói sẵn 1 bộ đăng ký mặc định (thường gặp trong các thư viện NuGet) — để ứng dụng dùng thư viện đó vẫn có thể tự đăng ký implementation riêng **trước khi** gọi `AddMyLogging()`, mà không bị thư viện âm thầm ghi đè mất.
+
+### 2.6. Composition Root — nơi duy nhất nên "biết" tới DI container
+
+📌 **Composition Root** là khái niệm chỉ **1 nơi duy nhất** trong toàn ứng dụng (thường là `Program.cs`) — nơi mọi `AddSingleton`/`AddScoped`/`AddTransient` được gọi, mọi "dây dợ" dependency được ráp lại với nhau. Mọi class khác trong ứng dụng (Controller, Handler, Service...) **không bao giờ** nên tự `new` lên 1 DI container khác, hay tự gọi `services.AddXxx()` rải rác nhiều nơi — toàn bộ việc "ráp dây" nên tập trung đúng 1 chỗ, càng gần entry point của ứng dụng càng tốt.
+
+✅ Lợi ích: muốn biết **toàn bộ** hệ thống dependency của ứng dụng trông ra sao, chỉ cần đọc đúng 1 file (`Program.cs`), không phải lục khắp codebase tìm xem còn chỗ nào đăng ký thêm service ở đâu đó. Đây cũng là lý do câu "class không nên tự `new` dependency của mình" (mục 2.1, 2.2.1... đã học từ đầu file) **không áp dụng** cho chính Composition Root — nó là **ngoại lệ có chủ đích**, vì nhiệm vụ của nó chính là tạo và ráp nối mọi thứ lại.
+
 ---
 
 ## 3. Middleware Pipeline — ASP.NET Core xử lý 1 request thế nào
@@ -276,6 +417,12 @@ Nhớ lại mục 2.1 ở trên (Captive Dependency): mọi `IHostedService`/`Ba
 | .NET vs .NET Framework vs CLR vs ASP.NET Core | Nền tảng / phiên bản cũ Windows-only / runtime thực thi / framework làm web, 4 tầng khác nhau |
 | Dependency Injection | Đảo ngược quyền kiểm soát — class khai báo cần gì, container lo tạo và tiêm vào |
 | Singleton/Scoped/Transient | Vòng đời ngắn phụ thuộc vòng đời dài: OK. Ngược lại: nguy hiểm (captive dependency) |
+| IEnumerable\<T\> injection | Nhiều đăng ký cùng interface → gom thành danh sách; inject thiếu `IEnumerable<>` chỉ lấy bản ĐĂNG KÝ SAU CÙNG |
+| Keyed Services | Chọn ĐÚNG 1 trong N implementation theo "khóa" — thay thế gọn cho tự viết Factory Pattern tay |
+| Factory injection (`Func<T>`) | Tạo object với tham số chỉ biết lúc RUNTIME — dependency cố định vẫn khai báo rõ qua constructor |
+| Service Locator | Anti-pattern — inject `IServiceProvider` rồi tự resolve tay giấu mất dependency thật sự, khó test |
+| TryAddSingleton/Scoped | Chỉ đăng ký nếu CHƯA có ai đăng ký trước — dùng khi viết extension method đóng gói sẵn cho thư viện |
+| Composition Root | 1 nơi DUY NHẤT (thường Program.cs) nên gọi Add*/biết tới container — ngoại lệ có chủ đích của nguyên tắc "đừng tự new" |
 | Middleware pipeline | Lồng nhau như lớp hành — thứ tự đăng ký quyết định thứ tự chạy |
 | Options Pattern | Config strongly-typed, an toàn hơn đọc string key trực tiếp |
 | static | Thuộc về type, không phải instance — khó test, tránh dùng cho service có state/dependency |
